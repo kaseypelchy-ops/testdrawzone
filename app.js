@@ -3788,12 +3788,21 @@ function pointInPolygon(lat, lng, polygon) {
 
 function _dzQueryBuildings_(points) {
   var polyStr = points.map(function(p) { return p.lat + ' ' + p.lng; }).join(' ');
-  // Query all buildings, exclude obvious non-residential
+
+  // PRIMARY: address nodes — these are what Nominatim resolves when you drop a pin.
+  // Far better coverage in US residential areas than building footprint tags.
+  // SECONDARY: building ways/nodes as a fallback for areas with footprints but no addr tags.
   var query =
-    '[out:json][timeout:30];\n' +
+    '[out:json][timeout:45];\n' +
     '(\n' +
-    '  way["building"]["building"!~"^(commercial|industrial|retail|office|warehouse|garage|shed|barn|church|school|hospital|hotel|supermarket|mall|civic|public)$"](poly:"' + polyStr + '");\n' +
-    '  node["building"](poly:"' + polyStr + '");\n' +
+    // Address nodes with both housenumber and street — highest quality, pin immediately
+    '  node["addr:housenumber"]["addr:street"](poly:"' + polyStr + '");\n' +
+    // Address ways (some subdivisions tag the parcel/lot rather than a node)
+    '  way["addr:housenumber"]["addr:street"](poly:"' + polyStr + '");\n' +
+    // Building footprints as fallback — will need reverse geocoding
+    '  way["building"]["building"!~"^(commercial|industrial|retail|office|warehouse|garage|shed|barn|church|school|hospital|hotel|supermarket|mall|civic|public|construction)$"](poly:"' + polyStr + '");\n' +
+    '  node["building"="house"](poly:"' + polyStr + '");\n' +
+    '  node["building"="residential"](poly:"' + polyStr + '");\n' +
     ');\n' +
     'out center tags;';
 
@@ -3808,6 +3817,72 @@ function _dzQueryBuildings_(points) {
     _dzClearVisuals_();
     toast('⚠ Zone scan failed: ' + String(err.message || err).substring(0, 60), 't-err');
   });
+}
+
+// US Census Bureau geocoder — free, no API key, best for US residential addresses
+// Falls back to Nominatim if Census returns no match
+function _dzReverseGeocode_(lat, lng, callback) {
+  var censusUrl =
+    'https://geocoding.geo.census.gov/geocoder/locations/coordinates' +
+    '?x=' + encodeURIComponent(lng) +
+    '&y=' + encodeURIComponent(lat) +
+    '&benchmark=2020&format=json';
+
+  fetch(censusUrl)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var matches = data &&
+                    data.result &&
+                    data.result.addressMatches;
+      if (matches && matches.length > 0) {
+        var m    = matches[0];
+        var addr = m.addressComponents || {};
+        var streetNum  = (addr.fromAddress || '').split('-')[0].trim();
+        var streetName = (addr.streetName || '').trim();
+        var suffix     = (addr.suffixType || '').trim();
+        var street     = [streetNum, streetName, suffix].filter(Boolean).join(' ');
+        if (!street) street = (m.matchedAddress || '').split(',')[0].trim();
+        callback({
+          address: street,
+          city:    (addr.city || '').trim(),
+          state:   (addr.state || '').trim(),
+          zip:     (addr.zip || '').trim()
+        });
+      } else {
+        // Census had no match — fall back to Nominatim
+        _dzNominatimReverse_(lat, lng, callback);
+      }
+    })
+    .catch(function() {
+      _dzNominatimReverse_(lat, lng, callback);
+    });
+}
+
+function _dzNominatimReverse_(lat, lng, callback) {
+  var url = 'https://nominatim.openstreetmap.org/reverse?format=json' +
+            '&lat=' + encodeURIComponent(lat) +
+            '&lon=' + encodeURIComponent(lng) +
+            '&zoom=18&addressdetails=1';
+  fetch(url, { headers: { 'Accept': 'application/json', 'User-Agent': 'FieldSalesApp/1.0' } })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var a  = data && data.address ? data.address : {};
+      var hn = (a.house_number || '').trim();
+      var rd = (a.road || a.pedestrian || a.path || '').trim();
+      var street = hn && rd ? (hn + ' ' + rd) : (rd || (data.display_name ? data.display_name.split(',')[0].trim() : ''));
+      callback({
+        address: street || ('Building at ' + lat.toFixed(5) + ',' + lng.toFixed(5)),
+        city:    a.city || a.town || a.village || a.hamlet || '',
+        state:   a.state ? stateAbbr(a.state) : '',
+        zip:     a.postcode || ''
+      });
+    })
+    .catch(function() {
+      callback({
+        address: 'Building at ' + lat.toFixed(5) + ',' + lng.toFixed(5),
+        city: '', state: '', zip: ''
+      });
+    });
 }
 
 function _dzProcessBuildings_(elements, polygonPoints) {
@@ -3900,7 +3975,7 @@ function confirmAddZoneBuildings() {
     return;
   }
 
-  // Geocode the rest progressively at 1/sec
+  // Geocode the rest progressively at 1.2/sec (Census allows ~50 req/s but be polite)
   var total = needGeo.length, done = 0, idx = 0;
   showGeocodeBar(0, total, 0);
 
@@ -3912,32 +3987,13 @@ function confirmAddZoneBuildings() {
       return;
     }
     var b = needGeo[idx++];
-    var url = 'https://nominatim.openstreetmap.org/reverse?format=json' +
-              '&lat=' + encodeURIComponent(b.lat) + '&lon=' + encodeURIComponent(b.lng) +
-              '&zoom=18&addressdetails=1';
-    fetch(url, { headers: { 'Accept': 'application/json', 'User-Agent': 'FieldSalesApp/1.0' } })
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        var a = data && data.address ? data.address : {};
-        var hn = (a.house_number || '').trim();
-        var rd = (a.road || a.pedestrian || a.path || '').trim();
-        var street = hn && rd ? (hn + ' ' + rd) : (rd || (data.display_name ? data.display_name.split(',')[0].trim() : ''));
-        if (!street) street = 'Building at ' + b.lat.toFixed(5) + ',' + b.lng.toFixed(5);
-        var city  = a.city || a.town || a.village || a.hamlet || '';
-        var state = a.state ? stateAbbr(a.state) : '';
-        var zip   = a.postcode || '';
-        _dzAddBuilding_(b.lat, b.lng, street, city, state, zip, zoneTerr);
-        done++;
-        showGeocodeBar(done, total, 0);
-        if (done % 15 === 0) { buildList(); updateStats(); }
-        setTimeout(geocodeNext, 1100);
-      })
-      .catch(function() {
-        _dzAddBuilding_(b.lat, b.lng, 'Building at ' + b.lat.toFixed(5) + ',' + b.lng.toFixed(5), '', '', '', zoneTerr);
-        done++;
-        showGeocodeBar(done, total, 0);
-        setTimeout(geocodeNext, 1100);
-      });
+    _dzReverseGeocode_(b.lat, b.lng, function(result) {
+      _dzAddBuilding_(b.lat, b.lng, result.address, result.city, result.state, result.zip, zoneTerr);
+      done++;
+      showGeocodeBar(done, total, 0);
+      if (done % 15 === 0) { buildList(); updateStats(); }
+      setTimeout(geocodeNext, 1200);
+    });
   }
   geocodeNext();
 }
